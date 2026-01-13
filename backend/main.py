@@ -5,8 +5,16 @@ from dotenv import load_dotenv
 import os
 import json
 import httpx
-
+from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev-only
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 load_dotenv()
 
 # ----- config from .env -----
