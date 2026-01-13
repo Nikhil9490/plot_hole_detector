@@ -1,276 +1,230 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Plot Hole Detector MVP</title>
-    <style>
-      body { font-family: system-ui, Arial; margin: 20px; max-width: 900px; }
-      textarea { width: 100%; height: 220px; padding: 10px; box-sizing: border-box; }
-      button { padding: 10px 14px; margin-top: 10px; cursor: pointer; }
-      .status { margin: 10px 0; font-size: 13px; }
-      .card { border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-top: 10px; }
-      .badge { display: inline-block; border: 1px solid #aaa; border-radius: 999px; padding: 2px 8px; font-size: 12px; margin-right: 6px; }
-      ul { margin: 8px 0 0 18px; }
+<head>
+  <meta charset="utf-8" />
+  <title>Plot Hole Detector MVP</title>
 
-      /* Floating overlay */
-      #overlay {
-        position: fixed;
-        right: 20px;
-        bottom: 20px;
-        width: 340px;
-        background: white;
-        border: 1px solid #ccc;
-        border-radius: 12px;
-        box-shadow: 0 10px 25px rgba(0,0,0,0.15);
-        padding: 12px;
-        display: none;
-        z-index: 9999;
-      }
-      #overlayTop {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 10px;
-      }
-      #overlayClose {
-        border: none;
-        background: transparent;
-        font-size: 18px;
-        cursor: pointer;
-        line-height: 1;
-      }
-      #overlayContent {
-        margin-top: 8px;
-        font-size: 13px;
-      }
-      #overlayHint {
-        margin-top: 8px;
-        font-size: 12px;
-        opacity: 0.7;
-      }
-    </style>
-  </head>
+  <style>
+    body {
+      font-family: system-ui, Arial;
+      margin: 20px;
+      max-width: 900px;
+    }
 
-  <body>
-    <h1>Plot Hole Detector (Browser MVP)</h1>
-    <p>
-      Paste text or type. This tool analyzes the <b>current paragraph</b> (where your cursor is),
-      auto-analyzes when you pause typing, and shows a floating warning overlay.
-    </p>
+    textarea {
+      width: 100%;
+      height: 240px;
+      padding: 10px;
+      box-sizing: border-box;
+      font-size: 14px;
+    }
 
-    <label for="text"><b>Text</b></label><br />
-    <textarea id="text" placeholder="Paste your scene here..."></textarea>
-    <br />
+    button {
+      padding: 10px 14px;
+      cursor: pointer;
+    }
 
-    <button id="analyzeBtn">Analyze Current Paragraph</button>
+    .status {
+      margin: 10px 0;
+      font-size: 13px;
+    }
+
+    .card {
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 10px;
+      margin-top: 10px;
+    }
+
+    .badge {
+      display: inline-block;
+      border: 1px solid #aaa;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      margin-right: 6px;
+    }
+
+    ul {
+      margin: 8px 0 0 18px;
+    }
+
+    #overlay {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      width: 340px;
+      background: white;
+      border-radius: 12px;
+      border: 1px solid #ccc;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+      padding: 12px;
+      display: none;
+      z-index: 9999;
+    }
+
+    #overlayTop {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    #overlayClose {
+      border: none;
+      background: none;
+      font-size: 18px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>AI Plot Hole Detector</h1>
+
+  <div style="display:flex; gap:10px; margin-bottom:10px;">
+    <input
+      id="docId"
+      placeholder="docId (example: novel-ch1)"
+      style="flex:1; padding:10px;"
+    />
     <button id="clipboardBtn">Analyze Clipboard</button>
+    <button id="analyzeBtn">Analyze Paragraph</button>
+  </div>
 
-    <div class="status" id="status"></div>
+  <textarea id="text" placeholder="Write or paste your story here..."></textarea>
 
-    <h2>Issues</h2>
-    <div id="issues"></div>
+  <div class="status" id="status"></div>
 
-    <!-- Floating overlay -->
-    <div id="overlay">
-      <div id="overlayTop">
-        <b>Writing Assistant</b>
-        <button id="overlayClose" title="Close">×</button>
-      </div>
-      <div id="overlayContent"></div>
-      <div id="overlayHint">Tip: click inside a paragraph and pause typing to auto-analyze.</div>
+  <h3>Issues</h3>
+  <div id="issues"></div>
+
+  <div id="overlay">
+    <div id="overlayTop">
+      <b>Writing Assistant</b>
+      <button id="overlayClose">×</button>
     </div>
+    <div id="overlayContent"></div>
+  </div>
 
-    <script>
-      const API = "http://127.0.0.1:8000";
+  <script>
+    const API = "http://127.0.0.1:8000";
 
-      const textEl = document.getElementById("text");
-      const statusEl = document.getElementById("status");
-      const issuesEl = document.getElementById("issues");
+    const textEl = document.getElementById("text");
+    const statusEl = document.getElementById("status");
+    const issuesEl = document.getElementById("issues");
+    const docIdEl = document.getElementById("docId");
 
-      const analyzeBtn = document.getElementById("analyzeBtn");
-      const clipboardBtn = document.getElementById("clipboardBtn");
+    const analyzeBtn = document.getElementById("analyzeBtn");
+    const clipboardBtn = document.getElementById("clipboardBtn");
 
-      // Overlay elements
-      const overlay = document.getElementById("overlay");
-      const overlayContent = document.getElementById("overlayContent");
-      const overlayClose = document.getElementById("overlayClose");
+    const overlay = document.getElementById("overlay");
+    const overlayContent = document.getElementById("overlayContent");
+    const overlayClose = document.getElementById("overlayClose");
 
-      function setStatus(msg) {
-        statusEl.textContent = msg || "";
+    docIdEl.value = localStorage.getItem("docId") || "novel-ch1";
+    docIdEl.addEventListener("input", () => {
+      localStorage.setItem("docId", docIdEl.value);
+    });
+
+    function setStatus(msg) {
+      statusEl.textContent = msg || "";
+    }
+
+    function getCursorIndex(el) {
+      return el.selectionStart || 0;
+    }
+
+    function getCurrentParagraph(text, cursor) {
+      const parts = text.split("\n");
+      let count = 0;
+
+      for (const p of parts) {
+        if (cursor >= count && cursor <= count + p.length) {
+          return p.trim();
+        }
+        count += p.length + 1;
       }
 
-      function render(issues) {
-        issuesEl.innerHTML = "";
-        if (!issues || issues.length === 0) {
-          issuesEl.innerHTML = `<div class="card">No issues found.</div>`;
-          return;
-        }
+      return text.trim();
+    }
 
-        for (const it of issues) {
-          const div = document.createElement("div");
-          div.className = "card";
+    function render(issues) {
+      issuesEl.innerHTML = "";
 
-          const header = document.createElement("div");
-          header.innerHTML = `
-            <span class="badge">${it.type}</span>
-            <span class="badge">${it.severity}</span>
-          `;
-          div.appendChild(header);
-
-          const msg = document.createElement("div");
-          msg.style.marginTop = "8px";
-          msg.textContent = it.message || "";
-          div.appendChild(msg);
-
-          if (it.evidence && it.evidence.length) {
-            const ul = document.createElement("ul");
-            for (const ev of it.evidence) {
-              const li = document.createElement("li");
-              li.textContent = ev;
-              ul.appendChild(li);
-            }
-            div.appendChild(ul);
-          }
-
-          issuesEl.appendChild(div);
-        }
+      if (!issues || !issues.length) {
+        issuesEl.innerHTML = "<div class='card'>No issues found</div>";
+        overlay.style.display = "none";
+        return;
       }
 
-      function showOverlay(issues) {
-        if (!issues || issues.length === 0) {
-          overlay.style.display = "none";
-          return;
-        }
+      for (const it of issues) {
+        const div = document.createElement("div");
+        div.className = "card";
 
-        // Show the most important issue first (MVP behavior)
-        const top = issues[0];
-        overlayContent.innerHTML = `
-          <div style="margin-bottom:6px;">
-            <span class="badge">${top.type}</span>
-            <span class="badge">${top.severity}</span>
-          </div>
-          <div>${top.message || ""}</div>
+        div.innerHTML = `
+          <span class="badge">${it.type}</span>
+          <span class="badge">${it.severity}</span>
+          <br>
+          ${it.message}
         `;
 
-        overlay.style.display = "block";
+        issuesEl.appendChild(div);
       }
 
-      overlayClose.addEventListener("click", () => {
-        overlay.style.display = "none";
+      const top = issues[0];
+      overlayContent.innerHTML = `
+        <b>${top.type} (${top.severity})</b><br>
+        ${top.message}
+      `;
+
+      overlay.style.display = "block";
+    }
+
+    async function analyze() {
+      const docId = (docIdEl.value || "novel-ch1").trim();
+      const fullText = textEl.value;
+      const para = getCurrentParagraph(fullText, getCursorIndex(textEl));
+
+      if (!para) {
+        setStatus("No paragraph found.");
+        return;
+      }
+
+      setStatus("Analyzing...");
+
+      const res = await fetch(`${API}/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          docId: docId,
+          text: para
+        })
       });
 
-      // -----------------------------
-      // Paragraph detection helpers
-      // -----------------------------
+      const data = await res.json();
+      render(data.issues);
+      setStatus(`Found ${data.issues.length} issue(s)`);
+    }
 
-      function getCursorIndex(el) {
-        return typeof el.selectionStart === "number" ? el.selectionStart : 0;
-      }
+    async function analyzeClipboard() {
+      const text = await navigator.clipboard.readText();
+      textEl.value = text;
+      textEl.focus();
+      textEl.selectionStart = textEl.selectionEnd = textEl.value.length;
+      analyze();
+    }
 
-      function getCurrentParagraph(fullText, cursorIndex) {
-        const parts = fullText.split("\n");
+    let timer = null;
+    textEl.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(analyze, 1200);
+    });
 
-        let count = 0;
-        for (let i = 0; i < parts.length; i++) {
-          const p = parts[i];
-          const start = count;
-          const end = count + p.length;
+    analyzeBtn.onclick = analyze;
+    clipboardBtn.onclick = analyzeClipboard;
+    overlayClose.onclick = () => overlay.style.display = "none";
+  </script>
 
-          if (cursorIndex >= start && cursorIndex <= end) {
-            return p.trim();
-          }
-
-          count = end + 1; // +1 for '\n'
-        }
-
-        return fullText.trim();
-      }
-
-      // -----------------------------
-      // Analyze current paragraph
-      // -----------------------------
-
-      async function analyze() {
-        const fullText = textEl.value;
-        const cursor = getCursorIndex(textEl);
-        const paragraph = getCurrentParagraph(fullText, cursor);
-
-        if (!paragraph) {
-          setStatus("No paragraph to analyze.");
-          showOverlay([]);
-          return;
-        }
-
-        analyzeBtn.disabled = true;
-        clipboardBtn.disabled = true;
-        setStatus("Analyzing current paragraph...");
-
-        try {
-          const res = await fetch(`${API}/analyze`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ docId: "browser-mvp", text: paragraph })
-          });
-
-          if (!res.ok) {
-            const t = await res.text();
-            throw new Error(`API ${res.status}: ${t}`);
-          }
-
-          const data = await res.json();
-          render(data.issues);
-          showOverlay(data.issues);
-          setStatus(`Done. Found ${data.issues.length} issue(s) in current paragraph.`);
-        } catch (e) {
-          setStatus("Error: " + e.message);
-        } finally {
-          analyzeBtn.disabled = false;
-          clipboardBtn.disabled = false;
-        }
-      }
-
-      // -----------------------------
-      // Analyze clipboard
-      // -----------------------------
-
-      async function analyzeClipboard() {
-        try {
-          setStatus("Reading clipboard...");
-
-          const clipText = await navigator.clipboard.readText();
-
-          if (!clipText.trim()) {
-            setStatus("Clipboard is empty. Copy something first.");
-            return;
-          }
-
-          textEl.value = clipText;
-          textEl.focus();
-          textEl.selectionStart = textEl.selectionEnd = textEl.value.length;
-
-          await analyze();
-        } catch (e) {
-          setStatus("Clipboard error: " + e.message);
-        }
-      }
-
-      // -----------------------------
-      // Auto-analyze on pause (debounce)
-      // -----------------------------
-
-      let typingTimer = null;
-      const PAUSE_MS = 1200;
-
-      textEl.addEventListener("input", () => {
-        if (typingTimer) clearTimeout(typingTimer);
-
-        typingTimer = setTimeout(() => {
-          analyze();
-        }, PAUSE_MS);
-      });
-
-      analyzeBtn.addEventListener("click", analyze);
-      clipboardBtn.addEventListener("click", analyzeClipboard);
-    </script>
-  </body>
+</body>
 </html>
