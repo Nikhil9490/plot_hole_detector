@@ -275,3 +275,23 @@ def reset_memory(doc_id: str):
     """
     STORY_MEMORY.pop(doc_id, None)
     return {"ok": True, "docId": doc_id}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# to run backend 
+# python -m uvicorn main:app --reload --port 8000
+
+
+# to run frontend
+# python -m http.server 5500
