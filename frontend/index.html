@@ -4,32 +4,106 @@
     <meta charset="utf-8" />
     <title>AI Plot Hole Detector</title>
     <style>
-      body { font-family: system-ui, Arial; margin: 20px; max-width: 1000px; }
-      .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
-      input[type="text"] { width: 260px; padding: 10px; font-size: 14px; }
-      textarea { width: 100%; height: 260px; padding: 12px; box-sizing: border-box; font-size: 14px; line-height: 1.35; }
-      button { padding: 10px 14px; cursor: pointer; }
-      .status { margin: 10px 0; font-size: 13px; color: #333; white-space: pre-wrap; }
-      .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin-top: 10px; }
-      .badge { display: inline-block; border: 1px solid #aaa; border-radius: 999px; padding: 2px 10px; font-size: 12px; margin-right: 6px; }
-      ul { margin: 8px 0 0 18px; }
-      h1 { margin-bottom: 6px; }
-      .hint { color: #666; margin-top: 0; }
+      body {
+        font-family: system-ui, Arial;
+        margin: 20px;
+        max-width: 1000px;
+      }
+
+      .row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      input[type="text"] {
+        width: 240px;
+        padding: 10px;
+        font-size: 14px;
+      }
+
+      textarea {
+        width: 100%;
+        height: 260px;
+        padding: 10px;
+        box-sizing: border-box;
+        font-size: 14px;
+        line-height: 1.35;
+      }
+
+      button {
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+
+      .status {
+        margin: 10px 0;
+        font-size: 13px;
+      }
+
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 10px;
+        padding: 12px;
+        margin-top: 10px;
+      }
+
+      .badge {
+        display: inline-block;
+        border: 1px solid #aaa;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 12px;
+        margin-right: 6px;
+      }
+
+      ul {
+        margin: 8px 0 0 18px;
+      }
+
+      .muted {
+        color: #666;
+      }
+
+      .toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        border: 1px solid #ddd;
+        border-radius: 10px;
+      }
+
+      .small {
+        font-size: 12px;
+      }
     </style>
   </head>
 
   <body>
     <h1>AI Plot Hole Detector</h1>
-    <p class="hint">Tip: Put a blank line between paragraphs for best “Analyze Paragraph” results.</p>
+    <p class="muted">
+      Live Mode auto-analyzes after you stop typing. (Debounced, so it won’t spam calls.)
+    </p>
 
     <div class="row">
-      <input id="docId" type="text" value="novel-ch1" />
+      <input id="docId" type="text" value="novel-ch1" placeholder="docId (e.g., novel-ch1)" />
+
       <button id="clipboardBtn">Analyze Clipboard</button>
-      <button id="paraBtn">Analyze Paragraph</button>
+      <button id="paragraphBtn">Analyze Paragraph</button>
       <button id="fullBtn">Analyze Full Text</button>
+
+      <label class="toggle">
+        <input id="liveToggle" type="checkbox" />
+        <span>Live Mode</span>
+        <span class="muted small" id="liveHint">(off)</span>
+      </label>
     </div>
 
-    <textarea id="text" placeholder="Paste your scene here..."></textarea>
+    <div style="margin-top: 10px;">
+      <textarea id="text" placeholder="Paste your scene here..."></textarea>
+    </div>
 
     <div class="status" id="status"></div>
 
@@ -37,25 +111,45 @@
     <div id="issues"></div>
 
     <script>
+      // Backend API (FastAPI)
       const API = "http://127.0.0.1:8000";
 
+      // UI elements
       const docIdEl = document.getElementById("docId");
       const textEl = document.getElementById("text");
       const statusEl = document.getElementById("status");
       const issuesEl = document.getElementById("issues");
 
       const clipboardBtn = document.getElementById("clipboardBtn");
-      const paraBtn = document.getElementById("paraBtn");
+      const paragraphBtn = document.getElementById("paragraphBtn");
       const fullBtn = document.getElementById("fullBtn");
+
+      const liveToggle = document.getElementById("liveToggle");
+      const liveHint = document.getElementById("liveHint");
+
+      // Live mode settings
+      const LIVE_DEBOUNCE_MS = 1200;
+      const MIN_CHARS_TO_LIVE_ANALYZE = 60;
+
+      let liveTimer = null;
+      let inFlight = false;
+      let lastSentTextHash = "";
 
       function setStatus(msg) {
         statusEl.textContent = msg || "";
       }
 
+      function setButtonsDisabled(disabled) {
+        clipboardBtn.disabled = disabled;
+        paragraphBtn.disabled = disabled;
+        fullBtn.disabled = disabled;
+      }
+
       function render(issues) {
         issuesEl.innerHTML = "";
+
         if (!issues || issues.length === 0) {
-          issuesEl.innerHTML = `<div class="card">No issues found</div>`;
+          issuesEl.innerHTML = `<div class="card">No issues found.</div>`;
           return;
         }
 
@@ -65,13 +159,13 @@
 
           const header = document.createElement("div");
           header.innerHTML = `
-            <span class="badge">${escapeHtml(it.type)}</span>
-            <span class="badge">${escapeHtml(it.severity)}</span>
+            <span class="badge">${escapeHtml(it.type || "Other")}</span>
+            <span class="badge">${escapeHtml(it.severity || "low")}</span>
           `;
           div.appendChild(header);
 
           const msg = document.createElement("div");
-          msg.style.marginTop = "10px";
+          msg.style.marginTop = "8px";
           msg.textContent = it.message || "";
           div.appendChild(msg);
 
@@ -89,30 +183,43 @@
         }
       }
 
+      // Simple safe HTML escape for badges
       function escapeHtml(s) {
-        return String(s ?? "")
+        return String(s)
           .replaceAll("&", "&amp;")
           .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;");
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
       }
 
-      function setBusy(isBusy) {
-        clipboardBtn.disabled = isBusy;
-        paraBtn.disabled = isBusy;
-        fullBtn.disabled = isBusy;
+      function getDocId() {
+        const v = docIdEl.value.trim();
+        return v ? v : "default";
       }
 
-      async function callAnalyze(textToSend, label) {
-        const docId = (docIdEl.value || "doc").trim() || "doc";
+      // Hash for "same text" skipping in live mode
+      function tinyHash(s) {
+        // Not cryptographic; just a quick stable signature
+        let h = 0;
+        for (let i = 0; i < s.length; i++) {
+          h = (h * 31 + s.charCodeAt(i)) >>> 0;
+        }
+        return String(h);
+      }
 
-        setBusy(true);
-        setStatus(`Analyzing (${label})...`);
+      async function callAnalyze(text, modeLabel) {
+        const docId = getDocId();
+        const payload = { docId, text };
+
+        setButtonsDisabled(true);
+        inFlight = true;
 
         try {
           const res = await fetch(`${API}/analyze`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ docId, text: textToSend })
+            body: JSON.stringify(payload)
           });
 
           if (!res.ok) {
@@ -122,82 +229,143 @@
 
           const data = await res.json();
           render(data.issues);
-          setStatus(`Done (${label}). Found ${data.issues.length} issue(s).`);
+
+          setStatus(`Done (${modeLabel}). Found ${data.issues.length} issue(s).`);
         } catch (e) {
           setStatus("Error: " + e.message);
         } finally {
-          setBusy(false);
+          inFlight = false;
+          setButtonsDisabled(false);
         }
       }
 
-      // -------- Paragraph extraction --------
-      // Defines "paragraph" as text between blank lines.
-      // If no blank line exists, falls back to "line block" around cursor.
-      function getParagraphAtCursor(fullText, cursorIndex) {
-        const text = fullText.replace(/\r\n/g, "\n"); // normalize Windows newlines
-        const i = Math.max(0, Math.min(cursorIndex ?? 0, text.length));
-
-        // First try: paragraph separated by blank lines (one or more empty lines)
-        // We'll search for \n\n boundaries around cursor.
-        let start = text.lastIndexOf("\n\n", i - 1);
-        let end = text.indexOf("\n\n", i);
-
-        // Convert boundary indexes to actual paragraph range
-        start = (start === -1) ? 0 : start + 2; // skip the delimiter
-        end = (end === -1) ? text.length : end;
-
-        let para = text.slice(start, end).trim();
-
-        // If paragraph is still empty, fallback to "line block":
-        // find nearest single newline boundaries
-        if (!para) {
-          let s2 = text.lastIndexOf("\n", i - 1);
-          let e2 = text.indexOf("\n", i);
-          s2 = (s2 === -1) ? 0 : s2 + 1;
-          e2 = (e2 === -1) ? text.length : e2;
-          para = text.slice(s2, e2).trim();
-        }
-
-        return para;
-      }
-
-      // -------- Buttons --------
-      fullBtn.addEventListener("click", async () => {
+      // ---------- Button actions ----------
+      async function analyzeFullText() {
         const text = textEl.value.trim();
-        if (!text) return setStatus("Paste some text first.");
+        if (!text) {
+          setStatus("Paste some text first.");
+          return;
+        }
+        setStatus("Analyzing full text...");
         await callAnalyze(text, "full text");
-      });
+      }
 
-      clipboardBtn.addEventListener("click", async () => {
+      async function analyzeClipboard() {
         try {
           setStatus("Reading clipboard...");
           const clipText = await navigator.clipboard.readText();
-          if (!clipText.trim()) return setStatus("Clipboard is empty. Copy something first.");
+
+          if (!clipText.trim()) {
+            setStatus("Clipboard is empty. Copy something first.");
+            return;
+          }
+
           textEl.value = clipText;
+          setStatus("Analyzing clipboard...");
           await callAnalyze(clipText.trim(), "clipboard");
         } catch (e) {
           setStatus("Clipboard error: " + e.message);
         }
-      });
+      }
 
-      paraBtn.addEventListener("click", async () => {
-        const full = textEl.value;
-        if (!full.trim()) return setStatus("Paste some text first.");
+      function extractParagraphAtCursor(fullText, cursorPos) {
+        // Paragraph = block separated by ONE OR MORE blank lines
+        // Works even if you have multiple newlines.
+        const before = fullText.slice(0, cursorPos);
+        const after = fullText.slice(cursorPos);
 
-        const cursor = textEl.selectionStart ?? 0;
-        const para = getParagraphAtCursor(full, cursor);
+        // Find paragraph start
+        const startMatch = before.match(/(\n\s*\n)[^\n]*$/);
+        const startIndex = startMatch ? startMatch.index + startMatch[1].length : 0;
 
-        if (!para) {
-          setStatus("No paragraph found. Tip: add a blank line between paragraphs.");
+        // Find paragraph end
+        const endMatch = after.match(/\n\s*\n/);
+        const endIndex = endMatch ? cursorPos + endMatch.index : fullText.length;
+
+        const para = fullText.slice(startIndex, endIndex).trim();
+        return para;
+      }
+
+      async function analyzeParagraph() {
+        const fullText = textEl.value;
+        if (!fullText.trim()) {
+          setStatus("Paste some text first.");
           return;
         }
 
-        // Optional: show what paragraph we extracted (first 200 chars)
-        const preview = para.length > 200 ? para.slice(0, 200) + "…" : para;
-        setStatus(`Selected paragraph:\n${preview}\n\nAnalyzing...`);
+        const cursor = textEl.selectionStart ?? 0;
+        const para = extractParagraphAtCursor(fullText, cursor);
 
+        if (!para) {
+          setStatus("No paragraph found. Add a blank line between paragraphs.");
+          return;
+        }
+
+        setStatus("Analyzing paragraph...");
         await callAnalyze(para, "paragraph");
+      }
+
+      // ---------- Live mode ----------
+      function scheduleLiveAnalyze() {
+        if (!liveToggle.checked) return;
+
+        const text = textEl.value.trim();
+
+        // Don't spam small text
+        if (text.length < MIN_CHARS_TO_LIVE_ANALYZE) {
+          setStatus(`Live Mode: waiting (need ${MIN_CHARS_TO_LIVE_ANALYZE}+ chars).`);
+          return;
+        }
+
+        // If request is in-flight, just wait; next keystroke will schedule again
+        if (inFlight) {
+          setStatus("Live Mode: waiting (request in progress)...");
+          return;
+        }
+
+        // Skip if identical to last analyzed text
+        const h = tinyHash(text);
+        if (h === lastSentTextHash) {
+          setStatus("Live Mode: no changes since last analyze.");
+          return;
+        }
+
+        if (liveTimer) clearTimeout(liveTimer);
+
+        setStatus(`Live Mode: analyzing in ${Math.round(LIVE_DEBOUNCE_MS / 100) / 10}s...`);
+        liveTimer = setTimeout(async () => {
+          // Re-check current text at fire time
+          const nowText = textEl.value.trim();
+          if (nowText.length < MIN_CHARS_TO_LIVE_ANALYZE) return;
+
+          const nowHash = tinyHash(nowText);
+          if (nowHash === lastSentTextHash) return;
+
+          lastSentTextHash = nowHash;
+          setStatus("Live Mode: analyzing...");
+          await callAnalyze(nowText, "live");
+        }, LIVE_DEBOUNCE_MS);
+      }
+
+      // Events
+      fullBtn.addEventListener("click", analyzeFullText);
+      clipboardBtn.addEventListener("click", analyzeClipboard);
+      paragraphBtn.addEventListener("click", analyzeParagraph);
+
+      liveToggle.addEventListener("change", () => {
+        if (liveToggle.checked) {
+          liveHint.textContent = "(on)";
+          scheduleLiveAnalyze(); // run once immediately after enabling (debounced)
+        } else {
+          liveHint.textContent = "(off)";
+          if (liveTimer) clearTimeout(liveTimer);
+          setStatus("");
+        }
       });
+
+      // Trigger live mode on typing / paste
+      textEl.addEventListener("input", scheduleLiveAnalyze);
+      textEl.addEventListener("paste", () => setTimeout(scheduleLiveAnalyze, 0));
     </script>
   </body>
 </html>
