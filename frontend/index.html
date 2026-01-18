@@ -85,10 +85,16 @@
     <h1>AI Plot Hole Detector</h1>
     <p class="muted">
       Live Mode auto-analyzes after you stop typing. (Debounced, so it won’t spam calls.)
+      Tip: Put a blank line between paragraphs for best “Analyze Paragraph” results.
     </p>
 
     <div class="row">
-      <input id="docId" type="text" value="novel-ch1" placeholder="docId (e.g., novel-ch1)" />
+      <input
+        id="docId"
+        type="text"
+        value="novel-ch1"
+        placeholder="docId (e.g., novel-ch1)"
+      />
 
       <button id="clipboardBtn">Analyze Clipboard</button>
       <button id="paragraphBtn">Analyze Paragraph</button>
@@ -200,7 +206,6 @@
 
       // Hash for "same text" skipping in live mode
       function tinyHash(s) {
-        // Not cryptographic; just a quick stable signature
         let h = 0;
         for (let i = 0; i < s.length; i++) {
           h = (h * 31 + s.charCodeAt(i)) >>> 0;
@@ -219,7 +224,7 @@
           const res = await fetch(`${API}/analyze`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
           });
 
           if (!res.ok) {
@@ -229,7 +234,6 @@
 
           const data = await res.json();
           render(data.issues);
-
           setStatus(`Done (${modeLabel}). Found ${data.issues.length} issue(s).`);
         } catch (e) {
           setStatus("Error: " + e.message);
@@ -246,6 +250,7 @@
           setStatus("Paste some text first.");
           return;
         }
+
         setStatus("Analyzing full text...");
         await callAnalyze(text, "full text");
       }
@@ -261,6 +266,7 @@
           }
 
           textEl.value = clipText;
+
           setStatus("Analyzing clipboard...");
           await callAnalyze(clipText.trim(), "clipboard");
         } catch (e) {
@@ -269,20 +275,33 @@
       }
 
       function extractParagraphAtCursor(fullText, cursorPos) {
-        // Paragraph = block separated by ONE OR MORE blank lines
-        // Works even if you have multiple newlines.
-        const before = fullText.slice(0, cursorPos);
-        const after = fullText.slice(cursorPos);
+        // Paragraph = block separated by ONE OR MORE blank lines.
+        // More robust than the previous regex approach.
 
-        // Find paragraph start
-        const startMatch = before.match(/(\n\s*\n)[^\n]*$/);
-        const startIndex = startMatch ? startMatch.index + startMatch[1].length : 0;
+        // Normalize Windows line endings
+        const text = fullText.replaceAll("\r\n", "\n");
 
-        // Find paragraph end
-        const endMatch = after.match(/\n\s*\n/);
-        const endIndex = endMatch ? cursorPos + endMatch.index : fullText.length;
+        // Clamp cursor
+        const pos = Math.max(0, Math.min(cursorPos, text.length));
 
-        const para = fullText.slice(startIndex, endIndex).trim();
+        // If there's no blank line at all, treat whole text as one paragraph.
+        const hasBlankLine = /\n\s*\n/.test(text);
+        if (!hasBlankLine) {
+          return text.trim();
+        }
+
+        // Find start: last blank-line boundary before cursor
+        const before = text.slice(0, pos);
+        const startBoundary = before.lastIndexOf("\n\n");
+        const start = startBoundary === -1 ? 0 : startBoundary + 2;
+
+        // Find end: next blank-line boundary after cursor
+        const after = text.slice(pos);
+        const nextBoundaryInAfter = after.search(/\n\s*\n/);
+        const end =
+          nextBoundaryInAfter === -1 ? text.length : pos + nextBoundaryInAfter;
+
+        const para = text.slice(start, end).trim();
         return para;
       }
 
@@ -293,7 +312,7 @@
           return;
         }
 
-        const cursor = textEl.selectionStart ?? 0;
+        const cursor = typeof textEl.selectionStart === "number" ? textEl.selectionStart : 0;
         const para = extractParagraphAtCursor(fullText, cursor);
 
         if (!para) {
@@ -311,19 +330,18 @@
 
         const text = textEl.value.trim();
 
-        // Don't spam small text
         if (text.length < MIN_CHARS_TO_LIVE_ANALYZE) {
-          setStatus(`Live Mode: waiting (need ${MIN_CHARS_TO_LIVE_ANALYZE}+ chars).`);
+          setStatus(
+            `Live Mode: waiting (need ${MIN_CHARS_TO_LIVE_ANALYZE}+ chars).`
+          );
           return;
         }
 
-        // If request is in-flight, just wait; next keystroke will schedule again
         if (inFlight) {
           setStatus("Live Mode: waiting (request in progress)...");
           return;
         }
 
-        // Skip if identical to last analyzed text
         const h = tinyHash(text);
         if (h === lastSentTextHash) {
           setStatus("Live Mode: no changes since last analyze.");
@@ -332,9 +350,11 @@
 
         if (liveTimer) clearTimeout(liveTimer);
 
-        setStatus(`Live Mode: analyzing in ${Math.round(LIVE_DEBOUNCE_MS / 100) / 10}s...`);
+        setStatus(
+          `Live Mode: analyzing in ${Math.round(LIVE_DEBOUNCE_MS / 100) / 10}s...`
+        );
+
         liveTimer = setTimeout(async () => {
-          // Re-check current text at fire time
           const nowText = textEl.value.trim();
           if (nowText.length < MIN_CHARS_TO_LIVE_ANALYZE) return;
 
@@ -355,7 +375,7 @@
       liveToggle.addEventListener("change", () => {
         if (liveToggle.checked) {
           liveHint.textContent = "(on)";
-          scheduleLiveAnalyze(); // run once immediately after enabling (debounced)
+          scheduleLiveAnalyze();
         } else {
           liveHint.textContent = "(off)";
           if (liveTimer) clearTimeout(liveTimer);

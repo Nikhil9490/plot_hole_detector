@@ -258,14 +258,22 @@ async def analyze(req: AnalyzeRequest):
             issues=issues,
             memory=STORY_MEMORY.get(req.docId, "")
         )
+    except Exception as e:
+        print("ANALYZE ERROR:", repr(e))
 
-    except Exception:
-        issues = fallback_rule_analyzer(req.text)
+    # visible issue so you KNOW the LLM failed
         return AnalyzeResponse(
             docId=req.docId,
-            issues=issues,
-            memory=STORY_MEMORY.get(req.docId, "")
+            issues=[
+                Issue(
+                    type="LLM_Output_Error",
+                    severity="high",
+                    message="Model response was not valid JSON, so analysis fell back. Check backend logs.",
+                    evidence=[str(e)[:180]],
+                )
+            ],
         )
+
 
 
 @app.post("/reset/{doc_id}")
