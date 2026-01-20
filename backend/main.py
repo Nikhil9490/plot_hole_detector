@@ -90,6 +90,17 @@ Rules:
 - Evidence MUST be exact short quotes copied from the input.
 - Only report issues you can support with evidence.
 - Avoid nitpicks; prefer fewer, higher-confidence issues.
+Do NOT report issues for:
+
+Missing details (e.g., unspecified location, time, or appearance)
+
+Vague narration or stylistic choices
+
+Normal human assumptions (e.g., clocks exist in many places)
+
+Information that could reasonably be inferred without contradiction
+
+Only report an issue if two or more statements cannot logically coexist.
 """.strip()
 
 REPAIR_PROMPT = """
