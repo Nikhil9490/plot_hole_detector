@@ -30,7 +30,6 @@
         box-sizing: border-box;
         font-size: 14px;
         line-height: 1.35;
-        white-space: pre-wrap;
       }
 
       button {
@@ -85,7 +84,8 @@
   <body>
     <h1>AI Plot Hole Detector</h1>
     <p class="muted">
-      Live Mode auto-analyzes after you stop typing. Tip: italic text pasted from Word becomes [[THOUGHT]] blocks.
+      Live Mode auto-analyzes after you stop typing. Tip: Word italics pasted via “Analyze Clipboard”
+      become <code>[[THOUGHT]]</code> blocks.
     </p>
 
     <div class="row">
@@ -112,8 +112,10 @@
     <div id="issues"></div>
 
     <script>
+      // Backend API (FastAPI)
       const API = "http://127.0.0.1:8000";
 
+      // UI elements
       const docIdEl = document.getElementById("docId");
       const textEl = document.getElementById("text");
       const statusEl = document.getElementById("status");
@@ -126,8 +128,9 @@
       const liveToggle = document.getElementById("liveToggle");
       const liveHint = document.getElementById("liveHint");
 
+      // Live mode settings
       const LIVE_DEBOUNCE_MS = 1200;
-      const MIN_CHARS_TO_LIVE_ANALYZE = 60;
+      const MIN_CHARS_TO_LIVE_ANALYZE = 80;
 
       let liveTimer = null;
       let inFlight = false;
@@ -141,15 +144,6 @@
         clipboardBtn.disabled = disabled;
         paragraphBtn.disabled = disabled;
         fullBtn.disabled = disabled;
-      }
-
-      function escapeHtml(s) {
-        return String(s)
-          .replaceAll("&", "&amp;")
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;")
-          .replaceAll('"', "&quot;")
-          .replaceAll("'", "&#039;");
       }
 
       function render(issues) {
@@ -166,7 +160,7 @@
 
           const header = document.createElement("div");
           header.innerHTML = `
-            <span class="badge">${escapeHtml(it.type || "other")}</span>
+            <span class="badge">${escapeHtml(it.type || "logic")}</span>
             <span class="badge">${escapeHtml(it.severity || "low")}</span>
           `;
           div.appendChild(header);
@@ -190,6 +184,15 @@
         }
       }
 
+      function escapeHtml(s) {
+        return String(s)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
       function getDocId() {
         const v = docIdEl.value.trim();
         return v ? v : "default";
@@ -205,7 +208,6 @@
 
       async function callAnalyze(text, modeLabel) {
         const docId = getDocId();
-        const payload = { docId, text };
 
         setButtonsDisabled(true);
         inFlight = true;
@@ -214,7 +216,7 @@
           const res = await fetch(`${API}/analyze`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
+            body: JSON.stringify({ docId, text })
           });
 
           if (!res.ok) {
@@ -224,7 +226,6 @@
 
           const data = await res.json();
           render(data.issues);
-
           setStatus(`Done (${modeLabel}). Found ${data.issues.length} issue(s).`);
         } catch (e) {
           setStatus("Error: " + e.message);
@@ -234,18 +235,68 @@
         }
       }
 
+      // ----------------------------
+      // Actions
+      // ----------------------------
       async function analyzeFullText() {
         const text = textEl.value.trim();
-        if (!text) return setStatus("Paste some text first.");
+        if (!text) {
+          setStatus("Paste some text first.");
+          return;
+        }
         setStatus("Analyzing full text...");
         await callAnalyze(text, "full text");
+      }
+
+      // Converts HTML clipboard to text, turning italics into [[THOUGHT]] blocks
+      function htmlToThoughtTaggedText(html) {
+        const div = document.createElement("div");
+        div.innerHTML = html;
+
+        // Convert <i>/<em> to explicit thought tags
+        div.querySelectorAll("i, em").forEach((el) => {
+          const t = el.textContent || "";
+          el.textContent = `[[THOUGHT]] ${t} [[/THOUGHT]]`;
+        });
+
+        // Convert <br> and <p> into newlines naturally via innerText
+        return div.innerText;
       }
 
       async function analyzeClipboard() {
         try {
           setStatus("Reading clipboard...");
+
+          // Best case: we can read HTML (Word formatting survives here)
+          if (navigator.clipboard && navigator.clipboard.read) {
+            const items = await navigator.clipboard.read();
+
+            for (const item of items) {
+              if (item.types.includes("text/html")) {
+                const blob = await item.getType("text/html");
+                const html = await blob.text();
+
+                const tagged = htmlToThoughtTaggedText(html).trim();
+                if (!tagged) {
+                  setStatus("Clipboard HTML was empty.");
+                  return;
+                }
+
+                textEl.value = tagged;
+                setStatus("Analyzing clipboard (formatted)...");
+                await callAnalyze(tagged, "clipboard formatted");
+                return;
+              }
+            }
+          }
+
+          // Fallback: plain text
           const clipText = await navigator.clipboard.readText();
-          if (!clipText.trim()) return setStatus("Clipboard is empty. Copy something first.");
+          if (!clipText.trim()) {
+            setStatus("Clipboard is empty. Copy something first.");
+            return;
+          }
+
           textEl.value = clipText;
           setStatus("Analyzing clipboard...");
           await callAnalyze(clipText.trim(), "clipboard");
@@ -254,32 +305,46 @@
         }
       }
 
+      // Paragraph = block separated by ONE OR MORE blank lines
       function extractParagraphAtCursor(fullText, cursorPos) {
-        const before = fullText.slice(0, cursorPos);
-        const after = fullText.slice(cursorPos);
+        // Normalize Windows newlines
+        const t = fullText.replaceAll("\r\n", "\n");
 
-        const startMatch = before.match(/(\n\s*\n)[\s\S]*$/);
-        const startIndex = startMatch ? startMatch.index + startMatch[1].length : 0;
+        // Find nearest blank-line boundary before cursor
+        const before = t.slice(0, cursorPos);
+        const after = t.slice(cursorPos);
 
-        const endMatch = after.match(/\n\s*\n/);
-        const endIndex = endMatch ? cursorPos + endMatch.index : fullText.length;
+        const startBoundary = before.lastIndexOf("\n\n");
+        const startIndex = startBoundary === -1 ? 0 : startBoundary + 2;
 
-        return fullText.slice(startIndex, endIndex).trim();
+        const endBoundary = after.indexOf("\n\n");
+        const endIndex = endBoundary === -1 ? t.length : cursorPos + endBoundary;
+
+        return t.slice(startIndex, endIndex).trim();
       }
 
       async function analyzeParagraph() {
         const fullText = textEl.value;
-        if (!fullText.trim()) return setStatus("Paste some text first.");
+        if (!fullText.trim()) {
+          setStatus("Paste some text first.");
+          return;
+        }
 
         const cursor = textEl.selectionStart ?? 0;
         const para = extractParagraphAtCursor(fullText, cursor);
 
-        if (!para) return setStatus("No paragraph found. Add a blank line between paragraphs.");
+        if (!para) {
+          setStatus("No paragraph found. Add a blank line between paragraphs.");
+          return;
+        }
 
         setStatus("Analyzing paragraph...");
         await callAnalyze(para, "paragraph");
       }
 
+      // ----------------------------
+      // Live mode
+      // ----------------------------
       function scheduleLiveAnalyze() {
         if (!liveToggle.checked) return;
 
@@ -317,92 +382,7 @@
         }, LIVE_DEBOUNCE_MS);
       }
 
-      // -----------------------------
-      // NEW: Preserve italics from Word paste
-      // Converts <i>/<em> to [[THOUGHT]]...[[/THOUGHT]]
-      // -----------------------------
-      function htmlToTextWithThoughtMarkers(html) {
-        const doc = new DOMParser().parseFromString(html, "text/html");
-
-        function walk(node, inThought) {
-          let out = "";
-
-          if (node.nodeType === Node.TEXT_NODE) {
-            return node.nodeValue || "";
-          }
-
-          if (node.nodeType !== Node.ELEMENT_NODE) return "";
-
-          const tag = node.tagName.toLowerCase();
-
-          // Word sometimes uses <i>, <em>, or spans with font-style: italic
-          const isItalicTag = (tag === "i" || tag === "em");
-          const isItalicStyle =
-            tag === "span" &&
-            node.getAttribute("style") &&
-            node.getAttribute("style").toLowerCase().includes("font-style: italic");
-
-          const nowThought = inThought || isItalicTag || isItalicStyle;
-
-          if (!inThought && nowThought) out += "[[THOUGHT]]";
-          if (inThought && !nowThought) out += "[[/THOUGHT]]";
-
-          if (tag === "br") return "\n";
-          if (tag === "p") {
-            // paragraph boundary
-            for (const child of node.childNodes) out += walk(child, nowThought);
-            return out + "\n\n";
-          }
-
-          for (const child of node.childNodes) out += walk(child, nowThought);
-
-          // close thought when leaving an italic block
-          if (!inThought && nowThought) out += "[[/THOUGHT]]";
-
-          return out;
-        }
-
-        let text = "";
-        for (const child of doc.body.childNodes) {
-          text += walk(child, false);
-        }
-
-        // Normalize weird spacing/newlines
-        text = text.replace(/\r/g, "");
-        text = text.replace(/\n{3,}/g, "\n\n");
-        return text.trim();
-      }
-
-      function insertAtCursor(textarea, insertText) {
-        const start = textarea.selectionStart ?? textarea.value.length;
-        const end = textarea.selectionEnd ?? textarea.value.length;
-        const before = textarea.value.slice(0, start);
-        const after = textarea.value.slice(end);
-
-        textarea.value = before + insertText + after;
-
-        const newPos = (before + insertText).length;
-        textarea.setSelectionRange(newPos, newPos);
-      }
-
-      textEl.addEventListener("paste", (e) => {
-        // Try to grab HTML first (to preserve italics)
-        const html = e.clipboardData?.getData("text/html");
-        if (html && html.trim()) {
-          e.preventDefault();
-          const converted = htmlToTextWithThoughtMarkers(html);
-          insertAtCursor(textEl, converted);
-          // trigger live analysis (if on)
-          setTimeout(scheduleLiveAnalyze, 0);
-          return;
-        }
-        // otherwise normal paste will happen (plain text)
-        setTimeout(scheduleLiveAnalyze, 0);
-      });
-
-      // -----------------------------
       // Events
-      // -----------------------------
       fullBtn.addEventListener("click", analyzeFullText);
       clipboardBtn.addEventListener("click", analyzeClipboard);
       paragraphBtn.addEventListener("click", analyzeParagraph);
@@ -419,6 +399,7 @@
       });
 
       textEl.addEventListener("input", scheduleLiveAnalyze);
+      textEl.addEventListener("paste", () => setTimeout(scheduleLiveAnalyze, 0));
     </script>
   </body>
 </html>

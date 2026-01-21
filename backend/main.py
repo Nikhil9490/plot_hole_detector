@@ -3,532 +3,259 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Optional, Literal
 from dotenv import load_dotenv
 import os
 import json
 import httpx
+import traceback
+import re
 
+load_dotenv()
 
-# ----------------------------
-# App + CORS
-# ----------------------------
+# ---------------------------
+# App + CORS (dev)
+# ---------------------------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev-only; tighten later
+    allow_origins=["*"],  # dev-only
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-load_dotenv()
+# ---------------------------
+# Config (OpenAI)
+# ---------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_JSON_MODE = os.getenv("OPENAI_JSON_MODE", "1").strip() == "1"
 
-
-# ----------------------------
-# Config
-# ----------------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai").rstrip("/")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
-# Simple in-memory story memory (per docId). Resets when server restarts.
-STORY_MEMORY: Dict[str, str] = {}
-
-
-# ----------------------------
+# ---------------------------
 # Schemas
-# ----------------------------
+# ---------------------------
 class AnalyzeRequest(BaseModel):
-    docId: str = Field(..., description="Document ID / chapter ID")
-    text: str = Field(..., description="Story text to analyze")
+    docId: str
+    text: str
 
+Severity = Literal["low", "medium", "high"]
 
 class Issue(BaseModel):
-    type: str
-    severity: str
-    message: str
-    evidence: List[str] = []
-
+    type: str = "logic"
+    severity: Severity = "low"
+    message: str = ""
+    evidence: List[str] = Field(default_factory=list)
 
 class AnalyzeResponse(BaseModel):
     docId: str
-    issues: List[Issue]
+    issues: List[Issue] = Field(default_factory=list)
 
-
-class MemoryUpsertRequest(BaseModel):
-    memory: str = Field(..., description="Facts / context to remember for this docId")
-
-
-# ----------------------------
-# Prompts
-# ----------------------------
+# ---------------------------
+# Prompt
+# ---------------------------
 SYSTEM_PROMPT = """
-You are an expert fiction editor and continuity checker.
+You are an expert fiction editor and a conservative plot-hole detector.
 
-Task:
-- Detect plot holes, timeline inconsistencies, spatial/setting contradictions, character inconsistencies, causal logic gaps, continuity errors, and unclear/confusing references.
-- You must rely on the provided text + story memory (if any). Do NOT invent facts.
+You must detect ONLY *true* logical/continuity contradictions, not style issues.
 
-Output format:
+Formatting markers:
+- [[THOUGHT]] ... [[/THOUGHT]] = internal monologue / mind voice.
+  Treat these as subjective and non-binding unless contradicted by objective facts later.
+- [[LETTER]] ... [[/LETTER]] = an in-world letter/note (can be misleading).
+- [[META]] ... [[/META]] = author notes, ignore for plot holes.
+
+Do NOT flag as plot holes:
+- Hyperbole (“no finer boy anywhere”), opinions, narrator voice, sarcasm.
+- Missing scene details unless it creates an actual contradiction.
+- Time compression unless explicit timestamps conflict.
+- Normal story transitions.
+- Do NOT infer object state changes unless explicitly stated.
+  Example: location (“under his bed”) does NOT imply “unwrapped”, “already used”, or any other state.
+
+Only flag if there is a hard contradiction (explicit in the text), e.g.:
+- Explicit impossible travel (“5 minutes later, New York -> Tokyo”)
+- Age/time math contradictions with explicit times
+- Character facts that negate earlier facts
+- Mutually exclusive locations/states at the same time (explicitly stated)
+
+Before emitting an issue, perform this test:
+"Is there a plausible interpretation where BOTH statements can be true without adding new facts?"
+If YES, do NOT flag.
+
 Return STRICT JSON only. No markdown. No extra text.
 
 Schema:
 {
   "issues": [
-    {
-      "type": "string",
-      "severity": "low|medium|high",
-      "message": "string",
-      "evidence": ["exact quote 1", "exact quote 2"]
-    }
+    {"type": "...", "severity": "low|medium|high", "message": "...", "evidence": ["...","..."]}
   ]
 }
 
 Rules:
-- Evidence MUST be exact short quotes copied from the input.
-- Only report issues you can support with evidence.
-- Avoid nitpicks; prefer fewer, higher-confidence issues.
-Do NOT report issues for:
-
-Missing details (e.g., unspecified location, time, or appearance)
-
-Vague narration or stylistic choices
-
-Normal human assumptions (e.g., clocks exist in many places)
-
-Information that could reasonably be inferred without contradiction
-
-Only report an issue if two or more statements cannot logically coexist.
+- Evidence must be DIRECT quotes from the provided text (verbatim substrings).
+- Prefer fewer, higher-confidence issues.
+- If no real issues: {"issues": []}
 """.strip()
 
-REPAIR_PROMPT = """
-You must output STRICT JSON only (no markdown, no extra text).
-Take the content below and convert it into valid JSON that matches this schema exactly:
-
-{
-  "issues": [
-    {
-      "type": "string",
-      "severity": "low|medium|high",
-      "message": "string",
-      "evidence": ["exact quote 1", "exact quote 2"]
-    }
-  ]
-}
-
-If the content has no issues, output:
-{"issues":[]}
-
-CONTENT TO CONVERT:
-""".strip()
-
-
-# ----------------------------
+# ---------------------------
 # Helpers
-# ----------------------------
-def extract_first_json_object(text: str) -> str:
-    """
-    Extract the first top-level JSON object from a string by scanning braces.
-    Handles model outputs that include extra text before/after JSON.
-    """
-    s = text.strip()
-    start = s.find("{")
-    if start == -1:
-        raise ValueError(f"No JSON object start found. Got: {s[:200]}")
+# ---------------------------
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-    depth = 0
-    in_str = False
-    esc = False
+def extract_json_block(s: str) -> str:
+    s = (s or "").strip()
+    m = _JSON_RE.search(s)
+    if not m:
+        raise ValueError(f"Model did not return JSON. Got: {s[:200]}")
+    return m.group(0)
 
-    for i in range(start, len(s)):
-        ch = s[i]
+def normalize_severity(s: str) -> Severity:
+    s = (s or "").strip().lower()
+    if s in ("low", "medium", "high"):
+        return s  # type: ignore
+    return "low"
 
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
+def evidence_is_direct_quote(evidence: List[str], original_text: str) -> bool:
+    if not evidence:
+        return False
+    return all(ev and (ev in original_text) for ev in evidence)
 
-        # not in string
-        if ch == '"':
-            in_str = True
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return s[start : i + 1]
+NUMERIC_TYPES = {"age", "time", "math", "timeline", "date"}
 
-    raise ValueError(f"Unbalanced braces; could not extract JSON. Got: {s[:200]}")
+def sanitize_issue(item: dict, original_text: str) -> Optional[Issue]:
+    try:
+        itype = str(item.get("type", "logic")).strip() or "logic"
+        sev = normalize_severity(str(item.get("severity", "low")))
+        msg = str(item.get("message", "")).strip()
+        ev = [str(x) for x in (item.get("evidence", []) or [])][:4]
 
+        if not msg:
+            return None
 
-def normalize_issues(payload: Dict[str, Any]) -> List[Issue]:
-    """
-    Normalize whatever the model returned into Issue objects safely.
-    """
-    raw = payload.get("issues", [])
-    issues: List[Issue] = []
+        # Allow numeric types even if evidence strings aren't perfect;
+        # we also run symbolic guards below.
+        if itype.lower() in NUMERIC_TYPES:
+            return Issue(type=itype, severity=sev, message=msg, evidence=ev)
 
-    if not isinstance(raw, list):
-        return issues
+        # Narrative issues must have verbatim evidence
+        if not evidence_is_direct_quote(ev, original_text):
+            return None
 
-    for it in raw:
-        if not isinstance(it, dict):
-            continue
-        issues.append(
-            Issue(
-                type=str(it.get("type", "Other")),
-                severity=str(it.get("severity", "low")),
-                message=str(it.get("message", "")).strip(),
-                evidence=[str(x) for x in (it.get("evidence", []) or [])][:4],
-            )
-        )
-    return issues
+        return Issue(type=itype, severity=sev, message=msg, evidence=ev)
+    except Exception:
+        return None
 
+# ---------------------------
+# Hybrid numeric guard: age vs birthday
+# ---------------------------
+AGE_RE = re.compile(r"\b(\d{1,3})\s*(?:year|years)[ -]?old\b", re.IGNORECASE)
+BIRTHDAY_RE = re.compile(r"\b(\d{1,3})(?:st|nd|rd|th)\s+birthday\b", re.IGNORECASE)
 
-def fallback_error_issue(err: Exception) -> List[Issue]:
-    """
-    IMPORTANT: We do NOT pretend we found 'no issues' if the LLM output broke.
-    This makes failures visible instead of silently lying.
-    """
-    return [
-        Issue(
-            type="LLM_Output_Error",
-            severity="high",
-            message="LLM response was not valid JSON, so analysis could not be completed.",
-            evidence=[repr(err)[:200]],
-        )
-    ]
+def detect_explicit_age_contradiction(text: str) -> Optional[Issue]:
+    ages = [int(m.group(1)) for m in AGE_RE.finditer(text)]
+    birthdays = [int(m.group(1)) for m in BIRTHDAY_RE.finditer(text)]
+    if not ages or not birthdays:
+        return None
 
+    for a in ages:
+        for b in birthdays:
+            if a != b:
+                age_match = AGE_RE.search(text)
+                bday_match = BIRTHDAY_RE.search(text)
+                evidence = []
+                if age_match:
+                    evidence.append(age_match.group(0))
+                if bday_match:
+                    evidence.append(bday_match.group(0))
+                return Issue(
+                    type="age",
+                    severity="high",
+                    message="Explicit age contradiction: stated age does not match stated birthday.",
+                    evidence=evidence[:4],
+                )
+    return None
 
-async def groq_chat(messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("Missing GROQ_API_KEY in backend/.env")
+# ---------------------------
+# OpenAI calls
+# ---------------------------
+async def openai_chat(payload: dict) -> dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY in backend/.env")
 
-    url = f"{GROQ_BASE_URL}/v1/chat/completions"
+    url = f"{OPENAI_BASE_URL}/chat/completions"
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "temperature": temperature,
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
-        data = r.json()
+        return r.json()
 
-    return data["choices"][0]["message"]["content"]
-
-
-async def groq_analyze(doc_id: str, text: str) -> Dict[str, Any]:
-    memory = STORY_MEMORY.get(doc_id, "").strip()
-
-    user_content = f"""
-STORY_MEMORY:
-{memory if memory else "(empty)"}
-
-NEW_TEXT:
-{text}
-""".strip()
-
-    content = await groq_chat(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0.2,
-    )
-
-    # Try direct JSON parse; if fails, extract JSON block; if still fails -> repair.
-    try:
-        return json.loads(content)
-    except Exception:
-        json_block = extract_first_json_object(content)
-        return json.loads(json_block)
-
-
-async def groq_repair_to_json(bad_content: str) -> Dict[str, Any]:
-    """
-    Second-chance: ask Groq to convert its previous output into strict JSON.
-    """
-    repaired = await groq_chat(
-        messages=[
-            {"role": "system", "content": "You are a strict JSON formatter."},
-            {"role": "user", "content": f"{REPAIR_PROMPT}\n\n{bad_content}"},
-        ],
-        temperature=0.0,
-    )
-
-    try:
-        return json.loads(repaired)
-    except Exception:
-        json_block = extract_first_json_object(repaired)
-        return json.loads(json_block)
-
-
-# ----------------------------
-# Routes
-# ----------------------------
-@app.get("/health")
-def health():
-    return {"ok": True, "model": GROQ_MODEL}
-
-
-@app.get("/memory/{docId}")
-def get_memory(docId: str):
-    return {"docId": docId, "memory": STORY_MEMORY.get(docId, "")}
-
-
-@app.post("/memory/{docId}")
-def set_memory(docId: str, req: MemoryUpsertRequest):
-    STORY_MEMORY[docId] = req.memory.strip()
-    return {"ok": True, "docId": docId, "memory_len": len(STORY_MEMORY[docId])}
-
-
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(req: AnalyzeRequest):
-    # 1) First attempt
-    try:
-        result = await groq_analyze(req.docId, req.text)
-        issues = normalize_issues(result)
-        return AnalyzeResponse(docId=req.docId, issues=issues)
-
-    except Exception as e1:
-        # 2) Repair attempt (use the error string to show in evidence if needed)
-        try:
-            # We don't have the raw model text here unless we capture it.
-            # So we re-run once and if it breaks again, we at least show failure.
-            # (If you want perfect repair: change groq_analyze() to return raw content too.)
-            content = await groq_chat(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"STORY_MEMORY:\n{STORY_MEMORY.get(req.docId,'') or '(empty)'}\n\nNEW_TEXT:\n{req.text}",
-                    },
-                ],
-                temperature=0.2,
-            )
-            repaired = await groq_repair_to_json(content)
-            issues = normalize_issues(repaired)
-            return AnalyzeResponse(docId=req.docId, issues=issues)
-
-        except Exception as e2:
-            # 3) Visible fallback (do NOT lie with empty issues)
-            return AnalyzeResponse(docId=req.docId, issues=fallback_error_issue(e2))
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict
-from dotenv import load_dotenv
-import os
-import json
-import httpx
-
-# ----------------------------
-# App + CORS
-# ----------------------------
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # dev-only; lock down later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-load_dotenv()
-
-# ----------------------------
-# Config (.env)
-# ----------------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai").rstrip("/")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
-# Optional: lightweight per-doc memory (in-process)
-STORY_MEMORY: Dict[str, str] = {}
-
-# ----------------------------
-# Schemas
-# ----------------------------
-class AnalyzeRequest(BaseModel):
-    docId: str
-    text: str
-
-class Issue(BaseModel):
-    type: str
-    severity: str
-    message: str
-    evidence: List[str] = []
-
-class AnalyzeResponse(BaseModel):
-    docId: str
-    issues: List[Issue]
-
-# ----------------------------
-# Prompt (updated)
-# ----------------------------
-SYSTEM_PROMPT = """
-You are a strict continuity & plot-hole checker for fiction.
-
-INPUT CONVENTIONS:
-- Text may include mind-voice / internal monologue wrapped in:
-  [[THOUGHT]] ... [[/THOUGHT]]
-  Treat those as thoughts, not literal timeline anchors.
-  Do NOT claim a plot hole based only on thoughts.
-
-OUTPUT:
-Return STRICT JSON only (no markdown, no extra text).
-
-Schema:
-{
-  "issues": [
-    {
-      "type": "timeline|location|character|causal|object|logic|dialogue|other",
-      "severity": "low|medium|high",
-      "message": "short, specific",
-      "evidence": ["quote 1", "quote 2"]
-    }
-  ]
-}
-
-HARD RULES (IMPORTANT):
-- Only report issues supported by direct evidence quotes from the text.
-- Do NOT infer missing facts (no guessing like “Sunday implies morning”).
-- Do NOT flag “unclear” or “ambiguous” as an issue unless it creates a direct contradiction.
-- Prefer fewer, higher-confidence issues over many weak ones.
-- If there is no clear contradiction, return {"issues": []}.
-""".strip()
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def extract_json_block(s: str) -> str:
-    """
-    Extract first {...} JSON object from model output in case it adds extra text.
-    """
-    s = s.strip()
-    start = s.find("{")
-    end = s.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError(f"Model did not return JSON. Got: {s[:300]}")
-    return s[start:end + 1]
-
-async def groq_analyze(doc_id: str, text: str) -> dict:
-    if not GROQ_API_KEY:
-        raise RuntimeError("Missing GROQ_API_KEY in backend/.env")
-
-    url = f"{GROQ_BASE_URL}/v1/chat/completions"
-
-    memory = STORY_MEMORY.get(doc_id, "").strip()
-
-    user_content = f"""
-STORY_MEMORY (facts from earlier text; may be empty):
-{memory if memory else "(empty)"}
-
-NEW_TEXT (analyze for contradictions against itself and STORY_MEMORY):
-{text}
-""".strip()
-
-    payload = {
-        "model": GROQ_MODEL,
+async def openai_analyze(text: str) -> dict:
+    base_payload = {
+        "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": text},
         ],
-        "temperature": 0.2,
+        "temperature": 0.0,
     }
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    # Prefer strict JSON if available
+    if OPENAI_JSON_MODE:
+        payload = {**base_payload, "response_format": {"type": "json_object"}}
+        data = await openai_chat(payload)
+        content = data["choices"][0]["message"]["content"]
+        return json.loads(content)
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-
+    # Fallback: extract JSON from content
+    data = await openai_chat(base_payload)
     content = data["choices"][0]["message"]["content"]
     json_str = extract_json_block(content)
     return json.loads(json_str)
 
-def safe_issues(result: dict) -> List[Issue]:
-    issues_raw = (result or {}).get("issues", []) or []
-    issues: List[Issue] = []
-    for it in issues_raw:
-        issues.append(
-            Issue(
-                type=str(it.get("type", "other")),
-                severity=str(it.get("severity", "low")),
-                message=str(it.get("message", "")),
-                evidence=[str(x) for x in (it.get("evidence", []) or [])][:4],
-            )
-        )
-    return issues
-
-# ----------------------------
+# ---------------------------
 # Routes
-# ----------------------------
+# ---------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "model": OPENAI_MODEL}
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
-    # Update memory with the latest text (simple approach)
-    # (Later we’ll store extracted facts instead of raw text)
-    prior = STORY_MEMORY.get(req.docId, "")
-    STORY_MEMORY[req.docId] = (prior + "\n\n" + req.text).strip()[-15000:]  # cap size
-
     try:
-        result = await groq_analyze(req.docId, req.text)
-        issues = safe_issues(result)
+        text = (req.text or "").strip()
+        issues: List[Issue] = []
+
+        if text:
+            # 1) LLM detection
+            result = await openai_analyze(text)
+            issues_raw = result.get("issues", []) or []
+
+            for it in issues_raw:
+                if isinstance(it, dict):
+                    cleaned = sanitize_issue(it, text)
+                    if cleaned is not None:
+                        issues.append(cleaned)
+
+            # 2) Hybrid hard-guard for explicit age contradiction
+            age_issue = detect_explicit_age_contradiction(text)
+            if age_issue is not None:
+                already = any(i.type.lower() == "age" and i.severity == "high" for i in issues)
+                if not already:
+                    issues.append(age_issue)
+
         return AnalyzeResponse(docId=req.docId, issues=issues)
+
     except Exception as e:
-        # If Groq fails, return a safe error as an "issue" instead of making up rules
-        return AnalyzeResponse(
-            docId=req.docId,
-            issues=[
-                Issue(
-                    type="other",
-                    severity="low",
-                    message=f"LLM call failed; returning no plot-hole analysis. Error: {type(e).__name__}",
-                    evidence=[],
-                )
-            ],
-        )
+        print("Analyze error:", repr(e))
+        traceback.print_exc()
+        return AnalyzeResponse(docId=req.docId, issues=[])
 
-
-
-
-
-
-# to run backend 
+# Run:
 # python -m uvicorn main:app --reload --port 8000
-
-
-# to run frontend
-# python -m http.server 5500
-
-
-
-
-
-
-
-
-
-
