@@ -1,5 +1,7 @@
 # plot_hole_detector
 
+<img width="2389" height="1531" alt="image" src="https://github.com/user-attachments/assets/fd10b7a5-f774-481a-9b0c-6697a4bcd370" />
+
 This project started as an attempt to answer a very specific question.
 
 Can we detect genuine plot holes while someone is writing, without turning every stylistic choice or ambiguity into a false alarm?
