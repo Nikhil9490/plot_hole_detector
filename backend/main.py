@@ -257,5 +257,7 @@ async def analyze(req: AnalyzeRequest):
         traceback.print_exc()
         return AnalyzeResponse(docId=req.docId, issues=[])
 
-# Run:
+# Run backend:
 # python -m uvicorn main:app --reload --port 8000
+# Run frontend:
+# python -m http.server 5500
