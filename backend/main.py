@@ -326,6 +326,190 @@ async def analyze(req: AnalyzeRequest):
         except Exception as e2:
             # 3) Visible fallback (do NOT lie with empty issues)
             return AnalyzeResponse(docId=req.docId, issues=fallback_error_issue(e2))
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from dotenv import load_dotenv
+import os
+import json
+import httpx
+
+# ----------------------------
+# App + CORS
+# ----------------------------
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev-only; lock down later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+load_dotenv()
+
+# ----------------------------
+# Config (.env)
+# ----------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai").rstrip("/")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# Optional: lightweight per-doc memory (in-process)
+STORY_MEMORY: Dict[str, str] = {}
+
+# ----------------------------
+# Schemas
+# ----------------------------
+class AnalyzeRequest(BaseModel):
+    docId: str
+    text: str
+
+class Issue(BaseModel):
+    type: str
+    severity: str
+    message: str
+    evidence: List[str] = []
+
+class AnalyzeResponse(BaseModel):
+    docId: str
+    issues: List[Issue]
+
+# ----------------------------
+# Prompt (updated)
+# ----------------------------
+SYSTEM_PROMPT = """
+You are a strict continuity & plot-hole checker for fiction.
+
+INPUT CONVENTIONS:
+- Text may include mind-voice / internal monologue wrapped in:
+  [[THOUGHT]] ... [[/THOUGHT]]
+  Treat those as thoughts, not literal timeline anchors.
+  Do NOT claim a plot hole based only on thoughts.
+
+OUTPUT:
+Return STRICT JSON only (no markdown, no extra text).
+
+Schema:
+{
+  "issues": [
+    {
+      "type": "timeline|location|character|causal|object|logic|dialogue|other",
+      "severity": "low|medium|high",
+      "message": "short, specific",
+      "evidence": ["quote 1", "quote 2"]
+    }
+  ]
+}
+
+HARD RULES (IMPORTANT):
+- Only report issues supported by direct evidence quotes from the text.
+- Do NOT infer missing facts (no guessing like “Sunday implies morning”).
+- Do NOT flag “unclear” or “ambiguous” as an issue unless it creates a direct contradiction.
+- Prefer fewer, higher-confidence issues over many weak ones.
+- If there is no clear contradiction, return {"issues": []}.
+""".strip()
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def extract_json_block(s: str) -> str:
+    """
+    Extract first {...} JSON object from model output in case it adds extra text.
+    """
+    s = s.strip()
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"Model did not return JSON. Got: {s[:300]}")
+    return s[start:end + 1]
+
+async def groq_analyze(doc_id: str, text: str) -> dict:
+    if not GROQ_API_KEY:
+        raise RuntimeError("Missing GROQ_API_KEY in backend/.env")
+
+    url = f"{GROQ_BASE_URL}/v1/chat/completions"
+
+    memory = STORY_MEMORY.get(doc_id, "").strip()
+
+    user_content = f"""
+STORY_MEMORY (facts from earlier text; may be empty):
+{memory if memory else "(empty)"}
+
+NEW_TEXT (analyze for contradictions against itself and STORY_MEMORY):
+{text}
+""".strip()
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.2,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+
+    content = data["choices"][0]["message"]["content"]
+    json_str = extract_json_block(content)
+    return json.loads(json_str)
+
+def safe_issues(result: dict) -> List[Issue]:
+    issues_raw = (result or {}).get("issues", []) or []
+    issues: List[Issue] = []
+    for it in issues_raw:
+        issues.append(
+            Issue(
+                type=str(it.get("type", "other")),
+                severity=str(it.get("severity", "low")),
+                message=str(it.get("message", "")),
+                evidence=[str(x) for x in (it.get("evidence", []) or [])][:4],
+            )
+        )
+    return issues
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(req: AnalyzeRequest):
+    # Update memory with the latest text (simple approach)
+    # (Later we’ll store extracted facts instead of raw text)
+    prior = STORY_MEMORY.get(req.docId, "")
+    STORY_MEMORY[req.docId] = (prior + "\n\n" + req.text).strip()[-15000:]  # cap size
+
+    try:
+        result = await groq_analyze(req.docId, req.text)
+        issues = safe_issues(result)
+        return AnalyzeResponse(docId=req.docId, issues=issues)
+    except Exception as e:
+        # If Groq fails, return a safe error as an "issue" instead of making up rules
+        return AnalyzeResponse(
+            docId=req.docId,
+            issues=[
+                Issue(
+                    type="other",
+                    severity="low",
+                    message=f"LLM call failed; returning no plot-hole analysis. Error: {type(e).__name__}",
+                    evidence=[],
+                )
+            ],
+        )
 
 
 
