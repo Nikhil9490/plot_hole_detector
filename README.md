@@ -37,3 +37,8 @@ It also highlights the limits of purely rule-based approaches and the necessity 
 This project is best understood as static analysis for fiction. It applies ideas from program verification to narrative text and treats plot holes as logical contradictions rather than stylistic flaws.
 
 Even where the project ends, the lessons from it carry forward into any system that depends on trustworthy AI reasoning.
+
+
+Deployment:
+
+<img width="1330" height="921" alt="image" src="https://github.com/user-attachments/assets/f317d654-87ea-4ad2-bdac-5c3433d3b7bf" />
