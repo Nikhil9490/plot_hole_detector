@@ -256,6 +256,16 @@ async def analyze(req: AnalyzeRequest):
         print("Analyze error:", repr(e))
         traceback.print_exc()
         return AnalyzeResponse(docId=req.docId, issues=[])
+    
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+# Serve frontend
+app.mount("/static", StaticFiles(directory="frontend", html=True), name="static")
+
+@app.get("/")
+def root():
+    return FileResponse("frontend/index.html")
 
 # Run backend:
 # python -m uvicorn main:app --reload --port 8000
